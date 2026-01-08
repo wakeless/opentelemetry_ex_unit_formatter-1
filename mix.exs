@@ -10,7 +10,7 @@ defmodule OpentelemetryExUnitFormatter.MixProject do
       version: @version,
       name: "OpentelemetryExUnitFormatter",
       description: "Opentelemetry instrumentation for `ExUnit.Formatter`.",
-      elixir: "~> 1.14.2",
+      elixir: "~> 1.14",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       package: package(),
@@ -23,11 +23,11 @@ defmodule OpentelemetryExUnitFormatter.MixProject do
 
   defp deps() do
     [
-      {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
+      {:credo, "~> 1.7.11", only: [:dev, :test], runtime: false},
       {:ex_doc, "~> 0.29.0", only: :dev, runtime: false},
       {:excoveralls, "~> 0.10", only: :test, runtime: false},
       {:opentelemetry, "~> 1.2"},
-      {:opentelemetry_exporter, "~> 1.4", only: :test, runtime: false}
+      {:opentelemetry_exporter, "~> 1.8", only: :test, runtime: false}
     ]
   end
 
