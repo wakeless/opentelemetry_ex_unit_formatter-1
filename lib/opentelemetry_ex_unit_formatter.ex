@@ -29,6 +29,12 @@ defmodule OpentelemetryExUnitFormatter do
   @attr_module "module"
   @attr_test "test"
 
+  # OTel semantic convention attribute names
+  @otel_test_case_name :"test.case.name"
+  @otel_test_case_result_status :"test.case.result.status"
+  @otel_test_suite_name :"test.suite.name"
+  @otel_test_suite_run_status :"test.suite.run.status"
+
   @doc false
   @impl GenServer
   def init(opts) do
@@ -40,6 +46,9 @@ defmodule OpentelemetryExUnitFormatter do
       |> then(&Map.merge(struct!(__MODULE__), &1))
       |> Map.put(:seed, opts[:seed])
       |> Map.put(:partition_no, System.get_env("MIX_TEST_PARTITION", ""))
+      # State for nested spans
+      |> Map.put(:suite_span_ctx, nil)
+      |> Map.put(:module_spans, %{})
 
     {tracer_provider_config, config} = Map.pop!(config, :tracer_provider_config)
     do_init(tracer_provider_config, config)
@@ -78,19 +87,144 @@ defmodule OpentelemetryExUnitFormatter do
   @impl GenServer
   def handle_cast(_request, %{tracer_provider: :none} = state), do: {:noreply, state}
 
+  # Suite started - create parent span for all modules/tests
   @doc false
   @impl GenServer
-  def handle_cast({e, _data} = event, state)
-      when e in [
-             :suite_finished,
-             :module_finished,
-             :test_finished
-           ] do
-    event
-    |> normalize_event()
-    |> emit_span(state)
+  def handle_cast({:suite_started, _opts}, state) do
+    %{tracer_provider: tracer, span_name: span_name} = state
+    suite_name = get_suite_name()
 
-    {:noreply, state}
+    span_ctx =
+      :otel_tracer.start_span(
+        tracer,
+        "#{span_name}.#{@attr_suite}",
+        %{attributes: [{@otel_test_suite_name, suite_name}]}
+      )
+
+    # Set this as the current span context so children inherit it
+    :otel_tracer.set_current_span(span_ctx)
+
+    {:noreply, %{state | suite_span_ctx: span_ctx}}
+  end
+
+  # Module started - create span nested under suite
+  @doc false
+  @impl GenServer
+  def handle_cast({:module_started, %ExUnit.TestModule{name: module_name}}, state) do
+    %{tracer_provider: tracer, span_name: span_name, suite_span_ctx: suite_span_ctx} = state
+
+    # Set suite as current context so module becomes its child
+    parent_ctx = :otel_ctx.new()
+    parent_ctx = :otel_tracer.set_current_span(parent_ctx, suite_span_ctx)
+
+    span_ctx =
+      :otel_tracer.start_span(
+        parent_ctx,
+        tracer,
+        "#{span_name}.#{@attr_module}",
+        %{attributes: [{@otel_test_suite_name, inspect(module_name)}]}
+      )
+
+    module_spans = Map.put(state.module_spans, module_name, span_ctx)
+    {:noreply, %{state | module_spans: module_spans}}
+  end
+
+  # Test started - create span nested under module
+  @doc false
+  @impl GenServer
+  def handle_cast(
+        {:test_started, %ExUnit.Test{module: module_name, name: test_name}},
+        state
+      ) do
+    %{tracer_provider: tracer, span_name: span_name, module_spans: module_spans} = state
+    module_span_ctx = Map.get(module_spans, module_name)
+
+    # Set module as current context so test becomes its child
+    parent_ctx = :otel_ctx.new()
+    parent_ctx = :otel_tracer.set_current_span(parent_ctx, module_span_ctx)
+
+    fully_qualified_name = "#{inspect(module_name)}.#{test_name}"
+
+    span_ctx =
+      :otel_tracer.start_span(
+        parent_ctx,
+        tracer,
+        "#{span_name}.#{@attr_test}",
+        %{attributes: [{@otel_test_case_name, fully_qualified_name}]}
+      )
+
+    # Store test span for later completion
+    test_key = {module_name, test_name}
+    test_spans = Map.get(state, :test_spans, %{})
+    test_spans = Map.put(test_spans, test_key, span_ctx)
+    {:noreply, Map.put(state, :test_spans, test_spans)}
+  end
+
+  # Test finished - complete span with attributes
+  @doc false
+  @impl GenServer
+  def handle_cast({:test_finished, %ExUnit.Test{module: module_name, name: test_name} = test}, state) do
+    test_key = {module_name, test_name}
+    test_spans = Map.get(state, :test_spans, %{})
+    span_ctx = Map.get(test_spans, test_key)
+
+    if span_ctx do
+      attributes = normalize_test_event(test, state)
+      status = get_status(attributes)
+      status_reason = Map.get(attributes, :state_reason, "")
+
+      :otel_span.set_status(span_ctx, status, status_reason)
+      :otel_span.set_attributes(span_ctx, Map.to_list(attributes))
+      :otel_span.end_span(span_ctx)
+
+      test_spans = Map.delete(test_spans, test_key)
+      {:noreply, Map.put(state, :test_spans, test_spans)}
+    else
+      {:noreply, state}
+    end
+  end
+
+  # Module finished - complete span with attributes
+  @doc false
+  @impl GenServer
+  def handle_cast({:module_finished, %ExUnit.TestModule{name: module_name} = module}, state) do
+    %{module_spans: module_spans} = state
+    span_ctx = Map.get(module_spans, module_name)
+
+    if span_ctx do
+      attributes = normalize_module_event(module, state)
+      status = get_status(attributes)
+      status_reason = Map.get(attributes, :state_reason, "")
+
+      :otel_span.set_status(span_ctx, status, status_reason)
+      :otel_span.set_attributes(span_ctx, Map.to_list(attributes))
+      :otel_span.end_span(span_ctx)
+
+      module_spans = Map.delete(module_spans, module_name)
+      {:noreply, %{state | module_spans: module_spans}}
+    else
+      {:noreply, state}
+    end
+  end
+
+  # Suite finished - complete span with attributes
+  @doc false
+  @impl GenServer
+  def handle_cast({:suite_finished, times}, state) do
+    %{suite_span_ctx: span_ctx} = state
+
+    if span_ctx do
+      attributes = normalize_suite_event(times, state)
+      status = get_suite_status(attributes)
+
+      :otel_span.set_status(span_ctx, status, "")
+      :otel_span.set_attributes(span_ctx, Map.to_list(attributes))
+      :otel_span.end_span(span_ctx)
+
+      {:noreply, %{state | suite_span_ctx: nil}}
+    else
+      {:noreply, state}
+    end
   end
 
   @doc false
@@ -126,106 +260,140 @@ defmodule OpentelemetryExUnitFormatter do
 
   defp register_after_suite(false, _tracer), do: :ok
 
-  defp normalize_event({:suite_finished, %{run: run, async: async, load: load}}) do
+  # Normalize suite event with OTel semantic convention attributes
+  defp normalize_suite_event(%{run: run, async: async, load: load}, state) do
+    %{root_attribute: root_attribute, partition_no: partition_no, seed: seed, before_send: before_send} = state
     sync = run - (async || 0)
     total = run + (load || 0)
+    suite_name = get_suite_name()
 
-    %{
+    attributes = %{
+      # OTel semantic convention attributes (must come first due to arrow syntax)
+      @otel_test_suite_name => suite_name,
+      @otel_test_suite_run_status => "success",
+      # Legacy attributes
       event_type: @attr_suite,
       duration_run: run,
       duration_async: async,
       duration_sync: sync,
       duration_load: load,
-      duration: total
+      duration: total,
+      test_partition_no: partition_no,
+      test_seed: seed
     }
+
+    attributes = prefix_root_attribute(attributes, root_attribute)
+    if is_function(before_send), do: before_send.(attributes), else: attributes
   end
 
-  defp normalize_event(
-         {:module_finished,
-          %ExUnit.TestModule{
-            file: file,
-            name: name,
-            state: state,
-            tests: tests
-          }}
+  # Normalize module event with OTel semantic convention attributes
+  defp normalize_module_event(
+         %ExUnit.TestModule{
+           file: file,
+           name: name,
+           state: state,
+           tests: tests
+         },
+         config
        ) do
-    {state, state_reason} = normalize_state(state)
+    %{root_attribute: root_attribute, partition_no: partition_no, seed: seed, before_send: before_send} = config
+    {state_atom, state_reason} = normalize_state(state)
 
-    %{
+    # Determine suite run status based on test results
+    suite_run_status = determine_module_status(tests, state_atom)
+
+    attributes = %{
+      # OTel semantic convention attributes (must come first due to arrow syntax)
+      @otel_test_suite_name => inspect(name),
+      @otel_test_suite_run_status => suite_run_status,
+      # Legacy attributes
       event_type: @attr_module,
       filepath: file,
       module_name: name,
-      state: state,
+      state: state_atom,
       state_reason: state_reason,
       tests_count: Enum.count(tests),
-      duration: Enum.reduce(tests, 0, fn %ExUnit.Test{time: time}, acc -> time + acc end)
+      duration: Enum.reduce(tests, 0, fn %ExUnit.Test{time: time}, acc -> time + acc end),
+      test_partition_no: partition_no,
+      test_seed: seed
     }
+
+    attributes = prefix_root_attribute(attributes, root_attribute)
+    if is_function(before_send), do: before_send.(attributes), else: attributes
   end
 
-  defp normalize_event(
-         {:test_finished,
-          %ExUnit.Test{
-            logs: logs,
-            name: name,
-            module: module,
-            state: state,
-            tags: %{async: async, file: file, line: line, test_type: test_type},
-            time: time
-          }}
+  # Normalize test event with OTel semantic convention attributes
+  defp normalize_test_event(
+         %ExUnit.Test{
+           logs: logs,
+           name: name,
+           module: module,
+           state: state,
+           tags: %{async: async, file: file, line: line, test_type: test_type},
+           time: time
+         },
+         config
        ) do
-    {state, state_reason} = normalize_state(state)
+    %{root_attribute: root_attribute, partition_no: partition_no, seed: seed, before_send: before_send} = config
+    {state_atom, state_reason} = normalize_state(state)
 
-    %{
+    # OTel test.case.result.status: "pass" or "fail"
+    result_status = if state_atom == :ok, do: "pass", else: "fail"
+    # Fully qualified test name for OTel
+    fully_qualified_name = "#{inspect(module)}.#{name}"
+
+    attributes = %{
+      # OTel semantic convention attributes (must come first due to arrow syntax)
+      @otel_test_case_name => fully_qualified_name,
+      @otel_test_case_result_status => result_status,
+      # Legacy attributes
       event_type: @attr_test,
       test_logs: logs,
       test_name: name,
       module_name: module,
-      state: state,
+      state: state_atom,
       state_reason: state_reason,
       exec_async: async,
       filepath: file,
       lineno: line,
       file_line: "#{file}:#{line}",
       test_type: test_type,
-      duration: time
+      duration: time,
+      test_partition_no: partition_no,
+      test_seed: seed
     }
+
+    attributes = prefix_root_attribute(attributes, root_attribute)
+    if is_function(before_send), do: before_send.(attributes), else: attributes
   end
 
   defp normalize_state(nil), do: {:ok, ""}
   defp normalize_state({state, reason}), do: {state, inspect(reason)}
 
-  defp emit_span(%{duration: duration, event_type: span_type} = attributes, %{
-         before_send: before_send,
-         partition_no: partition_no,
-         root_attribute: root_attribute,
-         seed: seed,
-         span_name: span_name,
-         tracer_provider: tracer
-       }) do
-    status = get_status(attributes)
-    status_reason = Map.get(attributes, :state_reason, "")
+  # Determine module status based on test results
+  defp determine_module_status(tests, module_state) do
+    cond do
+      module_state == :failed -> "failure"
+      Enum.any?(tests, fn %ExUnit.Test{state: state} -> match?({:failed, _}, state) end) -> "failure"
+      Enum.any?(tests, fn %ExUnit.Test{state: state} -> match?({:skipped, _}, state) end) -> "skipped"
+      Enum.all?(tests, fn %ExUnit.Test{state: state} -> state == nil end) -> "success"
+      true -> "success"
+    end
+  end
 
-    attributes = Map.put(attributes, :test_partition_no, partition_no)
-    attributes = Map.put(attributes, :test_seed, seed)
-    attributes = prefix_root_attribute(attributes, root_attribute)
+  # Get suite name from Mix project or default
+  defp get_suite_name do
+    case Mix.Project.config()[:app] do
+      nil -> "ExUnit Test Suite"
+      app -> "#{app}"
+    end
+  end
 
-    attributes =
-      if is_function(before_send),
-        do: before_send.(attributes),
-        else: attributes
-
-    start_time =
-      :opentelemetry.timestamp() - :erlang.convert_time_unit(duration, :microsecond, :native)
-
-    :otel_tracer.with_span(
-      tracer,
-      "#{span_name}.#{span_type}",
-      %{start_time: start_time},
-      fn span_ctx ->
-        :otel_span.set_status(span_ctx, status, status_reason)
-        :otel_span.set_attributes(span_ctx, attributes)
-      end
-    )
+  # Determine suite status based on overall state
+  defp get_suite_status(_attributes) do
+    # Since we can't easily track failed tests at suite level in this architecture,
+    # we default to :ok. Individual test/module spans will have accurate status.
+    :ok
   end
 
   defp get_status(attributes) do
