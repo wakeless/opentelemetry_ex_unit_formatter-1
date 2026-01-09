@@ -91,18 +91,22 @@ defmodule OpentelemetryExUnitFormatter do
     end
   end
 
+  # Log ALL incoming events for debugging
   @doc false
   @impl GenServer
-  def handle_cast(request, %{tracer_provider: :none} = state) do
-    IO.puts("[#{__MODULE__}] noop tracer - ignoring event: #{inspect(elem(request, 0))}")
+  def handle_cast(event, state) do
+    event_name = if is_tuple(event), do: elem(event, 0), else: event
+    IO.puts("[#{__MODULE__}] EVENT RECEIVED: #{inspect(event_name)}")
+    do_handle_cast(event, state)
+  end
+
+  defp do_handle_cast(_request, %{tracer_provider: :none} = state) do
     {:noreply, state}
   end
 
   # Suite started - create parent span for all modules/tests
   # We create a root span and store its trace_id/span_id for reference by child spans
-  @doc false
-  @impl GenServer
-  def handle_cast({:suite_started, _opts}, state) do
+  defp do_handle_cast({:suite_started, _opts}, state) do
     %{tracer_provider: tracer, span_name: span_name} = state
     suite_name = get_suite_name()
 
@@ -142,9 +146,7 @@ defmodule OpentelemetryExUnitFormatter do
 
   # Module/Case started - create span as child of suite
   # Handles both old (:module_started) and new (:case_started) event names
-  @doc false
-  @impl GenServer
-  def handle_cast({event, %{name: module_name}}, state)
+  defp do_handle_cast({event, %{name: module_name}}, state)
       when event in [:module_started, :case_started] do
     %{tracer_provider: tracer, span_name: span_name} = state
     suite_span_id = Map.get(state, :suite_span_id)
@@ -186,9 +188,7 @@ defmodule OpentelemetryExUnitFormatter do
   end
 
   # Test started - create span as child of module
-  @doc false
-  @impl GenServer
-  def handle_cast(
+  defp do_handle_cast(
         {:test_started, %ExUnit.Test{module: module_name, name: test_name}},
         state
       ) do
@@ -226,9 +226,7 @@ defmodule OpentelemetryExUnitFormatter do
   end
 
   # Test finished - complete span with attributes
-  @doc false
-  @impl GenServer
-  def handle_cast({:test_finished, %ExUnit.Test{module: module_name, name: test_name, state: test_state} = test}, state) do
+  defp do_handle_cast({:test_finished, %ExUnit.Test{module: module_name, name: test_name, state: test_state} = test}, state) do
     test_key = {module_name, test_name}
     test_spans = Map.get(state, :test_spans, %{})
     span_ctx = Map.get(test_spans, test_key)
@@ -251,9 +249,7 @@ defmodule OpentelemetryExUnitFormatter do
 
   # Module/Case finished - complete span with attributes
   # Handles both old (:module_finished) and new (:case_finished) event names
-  @doc false
-  @impl GenServer
-  def handle_cast({event, %{name: module_name, state: module_state} = module}, state)
+  defp do_handle_cast({event, %{name: module_name, state: module_state} = module}, state)
       when event in [:module_finished, :case_finished] do
     %{module_spans: module_spans} = state
     span_ctx = Map.get(module_spans, module_name)
@@ -276,9 +272,7 @@ defmodule OpentelemetryExUnitFormatter do
   end
 
   # Suite finished - complete span with attributes
-  @doc false
-  @impl GenServer
-  def handle_cast({:suite_finished, times}, state) do
+  defp do_handle_cast({:suite_finished, times}, state) do
     span_ctx = Map.get(state, :suite_span_ctx)
 
     IO.puts("[#{__MODULE__}] suite_finished: span_ctx=#{inspect(span_ctx)}")
@@ -302,10 +296,8 @@ defmodule OpentelemetryExUnitFormatter do
     end
   end
 
-  @doc false
-  @impl GenServer
-  def handle_cast(event, state) do
-    IO.puts("[#{__MODULE__}] unhandled event: #{inspect(event)}")
+  # Catch-all for unhandled events
+  defp do_handle_cast(_event, state) do
     {:noreply, state}
   end
 
