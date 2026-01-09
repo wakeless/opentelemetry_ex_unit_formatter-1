@@ -93,7 +93,10 @@ defmodule OpentelemetryExUnitFormatter do
 
   @doc false
   @impl GenServer
-  def handle_cast(_request, %{tracer_provider: :none} = state), do: {:noreply, state}
+  def handle_cast(request, %{tracer_provider: :none} = state) do
+    IO.puts("[#{__MODULE__}] noop tracer - ignoring event: #{inspect(elem(request, 0))}")
+    {:noreply, state}
+  end
 
   # Suite started - create parent span for all modules/tests
   # We create a root span and store its trace_id/span_id for reference by child spans
@@ -298,7 +301,10 @@ defmodule OpentelemetryExUnitFormatter do
 
   @doc false
   @impl GenServer
-  def handle_cast(_event, state), do: {:noreply, state}
+  def handle_cast(event, state) do
+    IO.puts("[#{__MODULE__}] unhandled event: #{inspect(event)}")
+    {:noreply, state}
+  end
 
   defp register_after_suite(true, tracer) do
     {type, name, delay} =
