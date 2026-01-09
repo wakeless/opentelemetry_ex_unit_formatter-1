@@ -48,6 +48,7 @@ defmodule OpentelemetryExUnitFormatter do
       |> Map.put(:partition_no, System.get_env("MIX_TEST_PARTITION", ""))
       # State for nested spans
       |> Map.put(:suite_span_ctx, nil)
+      |> Map.put(:suite_ctx, nil)
       |> Map.put(:module_spans, %{})
       |> Map.put(:module_contexts, %{})
       |> Map.put(:test_spans, %{})
@@ -96,32 +97,36 @@ defmodule OpentelemetryExUnitFormatter do
     %{tracer_provider: tracer, span_name: span_name} = state
     suite_name = get_suite_name()
 
+    # Get current context and start suite span
+    ctx = :otel_ctx.get_current()
+
     span_ctx =
       :otel_tracer.start_span(
+        ctx,
         tracer,
         "#{span_name}.#{@attr_suite}",
         %{attributes: [{@otel_test_suite_name, suite_name}]}
       )
 
-    # Set this as the current span context so children inherit it
+    # Set this as the current span in process context and store the context
     :otel_tracer.set_current_span(span_ctx)
+    suite_ctx = :otel_tracer.set_current_span(ctx, span_ctx)
 
-    {:noreply, %{state | suite_span_ctx: span_ctx}}
+    {:noreply, state |> Map.put(:suite_span_ctx, span_ctx) |> Map.put(:suite_ctx, suite_ctx)}
   end
 
   # Module started - create span nested under suite
   @doc false
   @impl GenServer
   def handle_cast({:module_started, %ExUnit.TestModule{name: module_name}}, state) do
-    %{tracer_provider: tracer, span_name: span_name, suite_span_ctx: suite_span_ctx} = state
+    %{tracer_provider: tracer, span_name: span_name} = state
 
-    # Get current context and set suite span as parent for proper nesting
-    parent_ctx = :otel_ctx.get_current()
-    parent_ctx = :otel_tracer.set_current_span(parent_ctx, suite_span_ctx)
+    # Use the stored suite context as parent for proper nesting
+    suite_ctx = Map.get(state, :suite_ctx) || :otel_ctx.get_current()
 
     span_ctx =
       :otel_tracer.start_span(
-        parent_ctx,
+        suite_ctx,
         tracer,
         "#{span_name}.#{@attr_module}",
         %{attributes: [{@otel_test_suite_name, inspect(module_name)}]}
@@ -131,7 +136,7 @@ defmodule OpentelemetryExUnitFormatter do
     module_spans = Map.put(state.module_spans, module_name, span_ctx)
     module_contexts = Map.get(state, :module_contexts, %{})
     # Create context with module span set as current for test children
-    module_ctx = :otel_tracer.set_current_span(parent_ctx, span_ctx)
+    module_ctx = :otel_tracer.set_current_span(suite_ctx, span_ctx)
     module_contexts = Map.put(module_contexts, module_name, module_ctx)
 
     {:noreply, state |> Map.put(:module_spans, module_spans) |> Map.put(:module_contexts, module_contexts)}
