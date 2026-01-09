@@ -72,15 +72,20 @@ defmodule OpentelemetryExUnitFormatter do
           {Application.get_application(__MODULE__), Mix.Project.config()[:version], :undefined}
       end
 
+    IO.puts("[#{__MODULE__}] Initializing tracer provider with config: #{inspect(tracer_provider_config)}")
+
     case :otel_tracer_provider.get_tracer(__MODULE__, name, vsn, schema_url) do
       {:otel_tracer_noop, []} ->
+        IO.puts("[#{__MODULE__}] Got noop tracer, starting new tracer provider...")
         {:ok, _pid} = :opentelemetry.start_tracer_provider(__MODULE__, tracer_provider_config)
         tracer = :otel_tracer_provider.get_tracer(__MODULE__, name, vsn, schema_url)
+        IO.puts("[#{__MODULE__}] New tracer: #{inspect(tracer)}")
         register_after_suite(config.register_after_suite?, tracer_provider_config)
         config = Map.put(config, :tracer_provider, tracer)
         {:ok, config}
 
       tracer ->
+        IO.puts("[#{__MODULE__}] Got existing tracer: #{inspect(tracer)}")
         config = Map.put(config, :tracer_provider, tracer)
         {:ok, config}
     end
@@ -96,6 +101,8 @@ defmodule OpentelemetryExUnitFormatter do
   def handle_cast({:suite_started, _opts}, state) do
     %{tracer_provider: tracer, span_name: span_name} = state
     suite_name = get_suite_name()
+
+    IO.puts("[#{__MODULE__}] suite_started: tracer=#{inspect(tracer)}")
 
     # Get current context and start suite span
     ctx = :otel_ctx.get_current()
