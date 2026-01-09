@@ -91,12 +91,9 @@ defmodule OpentelemetryExUnitFormatter do
     end
   end
 
-  # Log ALL incoming events for debugging
   @doc false
   @impl GenServer
   def handle_cast(event, state) do
-    event_name = if is_tuple(event), do: elem(event, 0), else: event
-    IO.puts("[#{__MODULE__}] EVENT RECEIVED: #{inspect(event_name)}")
     do_handle_cast(event, state)
   end
 
@@ -109,8 +106,6 @@ defmodule OpentelemetryExUnitFormatter do
   defp do_handle_cast({:suite_started, _opts}, state) do
     %{tracer_provider: tracer, span_name: span_name} = state
     suite_name = get_suite_name()
-
-    IO.puts("[#{__MODULE__}] suite_started: tracer=#{inspect(tracer)}")
 
     # Get current context and start suite span
     ctx = :otel_ctx.get_current()
@@ -126,8 +121,6 @@ defmodule OpentelemetryExUnitFormatter do
     # Extract trace_id and span_id for reference by child spans (as attributes, not parent links)
     trace_id = :otel_span.trace_id(span_ctx)
     suite_span_id = :otel_span.span_id(span_ctx)
-
-    IO.puts("[#{__MODULE__}] suite_started: trace_id=#{inspect(trace_id)}, span_id=#{inspect(suite_span_id)}")
 
     # Set this as the current span in process context and store the context
     :otel_tracer.set_current_span(span_ctx)
@@ -275,23 +268,16 @@ defmodule OpentelemetryExUnitFormatter do
   defp do_handle_cast({:suite_finished, times}, state) do
     span_ctx = Map.get(state, :suite_span_ctx)
 
-    IO.puts("[#{__MODULE__}] suite_finished: span_ctx=#{inspect(span_ctx)}")
-
     if span_ctx do
       attributes = normalize_suite_event(times, state)
       status = get_suite_status(attributes)
-
-      IO.puts("[#{__MODULE__}] suite_finished: ending span with status=#{inspect(status)}")
 
       :otel_span.set_status(span_ctx, status, "")
       :otel_span.set_attributes(span_ctx, Map.to_list(attributes))
       :otel_span.end_span(span_ctx)
 
-      IO.puts("[#{__MODULE__}] suite_finished: span ended successfully")
-
       {:noreply, %{state | suite_span_ctx: nil}}
     else
-      IO.puts("[#{__MODULE__}] suite_finished: NO SPAN CTX - suite span was not created!")
       {:noreply, state}
     end
   end
