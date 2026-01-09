@@ -112,6 +112,9 @@ defmodule OpentelemetryExUnitFormatter do
     :otel_tracer.set_current_span(span_ctx)
     suite_ctx = :otel_tracer.set_current_span(ctx, span_ctx)
 
+    # Attach context to process dictionary
+    :otel_ctx.attach(suite_ctx)
+
     {:noreply, state |> Map.put(:suite_span_ctx, span_ctx) |> Map.put(:suite_ctx, suite_ctx)}
   end
 
@@ -176,15 +179,15 @@ defmodule OpentelemetryExUnitFormatter do
   # Test finished - complete span with attributes
   @doc false
   @impl GenServer
-  def handle_cast({:test_finished, %ExUnit.Test{module: module_name, name: test_name} = test}, state) do
+  def handle_cast({:test_finished, %ExUnit.Test{module: module_name, name: test_name, state: test_state} = test}, state) do
     test_key = {module_name, test_name}
     test_spans = Map.get(state, :test_spans, %{})
     span_ctx = Map.get(test_spans, test_key)
 
     if span_ctx do
       attributes = normalize_test_event(test, state)
-      status = get_status(attributes)
-      status_reason = Map.get(attributes, :state_reason, "")
+      status = get_status_from_state(test_state)
+      status_reason = get_status_reason(test_state)
 
       :otel_span.set_status(span_ctx, status, status_reason)
       :otel_span.set_attributes(span_ctx, Map.to_list(attributes))
@@ -200,14 +203,14 @@ defmodule OpentelemetryExUnitFormatter do
   # Module finished - complete span with attributes
   @doc false
   @impl GenServer
-  def handle_cast({:module_finished, %ExUnit.TestModule{name: module_name} = module}, state) do
+  def handle_cast({:module_finished, %ExUnit.TestModule{name: module_name, state: module_state} = module}, state) do
     %{module_spans: module_spans} = state
     span_ctx = Map.get(module_spans, module_name)
 
     if span_ctx do
       attributes = normalize_module_event(module, state)
-      status = get_status(attributes)
-      status_reason = Map.get(attributes, :state_reason, "")
+      status = get_status_from_state(module_state)
+      status_reason = get_status_reason(module_state)
 
       :otel_span.set_status(span_ctx, status, status_reason)
       :otel_span.set_attributes(span_ctx, Map.to_list(attributes))
@@ -410,13 +413,16 @@ defmodule OpentelemetryExUnitFormatter do
     :ok
   end
 
-  defp get_status(attributes) do
-    case Map.get(attributes, :state) do
-      :ok -> :ok
-      :failed -> :error
-      _any -> :unset
-    end
-  end
+  # Get OTel status from ExUnit state
+  defp get_status_from_state(nil), do: :ok
+  defp get_status_from_state({:failed, _}), do: :error
+  defp get_status_from_state({:skipped, _}), do: :ok
+  defp get_status_from_state(_), do: :unset
+
+  # Get status reason from ExUnit state
+  defp get_status_reason(nil), do: ""
+  defp get_status_reason({_, reason}), do: inspect(reason)
+  defp get_status_reason(_), do: ""
 
   defp prefix_root_attribute(attributes, root_attribute) do
     attributes
