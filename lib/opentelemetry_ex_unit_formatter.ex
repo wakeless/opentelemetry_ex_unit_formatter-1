@@ -96,6 +96,7 @@ defmodule OpentelemetryExUnitFormatter do
   def handle_cast(_request, %{tracer_provider: :none} = state), do: {:noreply, state}
 
   # Suite started - create parent span for all modules/tests
+  # We create a root span and store its trace_id/span_id for reference by child spans
   @doc false
   @impl GenServer
   def handle_cast({:suite_started, _opts}, state) do
@@ -115,6 +116,12 @@ defmodule OpentelemetryExUnitFormatter do
         %{attributes: [{@otel_test_suite_name, suite_name}]}
       )
 
+    # Extract trace_id and span_id for reference by child spans (as attributes, not parent links)
+    trace_id = :otel_span.trace_id(span_ctx)
+    suite_span_id = :otel_span.span_id(span_ctx)
+
+    IO.puts("[#{__MODULE__}] suite_started: trace_id=#{inspect(trace_id)}, span_id=#{inspect(suite_span_id)}")
+
     # Set this as the current span in process context and store the context
     :otel_tracer.set_current_span(span_ctx)
     suite_ctx = :otel_tracer.set_current_span(ctx, span_ctx)
@@ -122,16 +129,23 @@ defmodule OpentelemetryExUnitFormatter do
     # Attach context to process dictionary
     :otel_ctx.attach(suite_ctx)
 
-    {:noreply, state |> Map.put(:suite_span_ctx, span_ctx) |> Map.put(:suite_ctx, suite_ctx)}
+    {:noreply,
+     state
+     |> Map.put(:suite_span_ctx, span_ctx)
+     |> Map.put(:suite_ctx, suite_ctx)
+     |> Map.put(:suite_trace_id, trace_id)
+     |> Map.put(:suite_span_id, suite_span_id)}
   end
 
-  # Module started - create span nested under suite
+  # Module started - create span as sibling (not child) of suite, but with same trace_id
+  # Store suite_span_id as attribute for reference
   @doc false
   @impl GenServer
   def handle_cast({:module_started, %ExUnit.TestModule{name: module_name}}, state) do
     %{tracer_provider: tracer, span_name: span_name} = state
+    suite_span_id = Map.get(state, :suite_span_id)
 
-    # Use the stored suite context as parent for proper nesting
+    # Use suite context as parent so module spans are children of suite
     suite_ctx = Map.get(state, :suite_ctx) || :otel_ctx.get_current()
 
     span_ctx =
@@ -139,20 +153,35 @@ defmodule OpentelemetryExUnitFormatter do
         suite_ctx,
         tracer,
         "#{span_name}.#{@attr_module}",
-        %{attributes: [{@otel_test_suite_name, inspect(module_name)}]}
+        %{
+          attributes: [
+            {@otel_test_suite_name, inspect(module_name)},
+            {:"test.suite.span_id", format_span_id(suite_span_id)}
+          ]
+        }
       )
 
-    # Store both the span context and the full otel context for child spans
+    # Extract module span_id for test reference
+    module_span_id = :otel_span.span_id(span_ctx)
+
+    # Store both the span context and span_id for child spans
     module_spans = Map.put(state.module_spans, module_name, span_ctx)
-    module_contexts = Map.get(state, :module_contexts, %{})
+    module_span_ids = Map.get(state, :module_span_ids, %{})
+    module_span_ids = Map.put(module_span_ids, module_name, module_span_id)
+
     # Create context with module span set as current for test children
     module_ctx = :otel_tracer.set_current_span(suite_ctx, span_ctx)
+    module_contexts = Map.get(state, :module_contexts, %{})
     module_contexts = Map.put(module_contexts, module_name, module_ctx)
 
-    {:noreply, state |> Map.put(:module_spans, module_spans) |> Map.put(:module_contexts, module_contexts)}
+    {:noreply,
+     state
+     |> Map.put(:module_spans, module_spans)
+     |> Map.put(:module_span_ids, module_span_ids)
+     |> Map.put(:module_contexts, module_contexts)}
   end
 
-  # Test started - create span nested under module
+  # Test started - create span as child of module
   @doc false
   @impl GenServer
   def handle_cast(
@@ -162,6 +191,9 @@ defmodule OpentelemetryExUnitFormatter do
     %{tracer_provider: tracer, span_name: span_name} = state
     module_contexts = Map.get(state, :module_contexts, %{})
     module_ctx = Map.get(module_contexts, module_name)
+    module_span_ids = Map.get(state, :module_span_ids, %{})
+    module_span_id = Map.get(module_span_ids, module_name)
+    suite_span_id = Map.get(state, :suite_span_id)
 
     # Use the module's context as parent for proper nesting
     parent_ctx = module_ctx || :otel_ctx.get_current()
@@ -173,7 +205,13 @@ defmodule OpentelemetryExUnitFormatter do
         parent_ctx,
         tracer,
         "#{span_name}.#{@attr_test}",
-        %{attributes: [{@otel_test_case_name, fully_qualified_name}]}
+        %{
+          attributes: [
+            {@otel_test_case_name, fully_qualified_name},
+            {:"test.suite.span_id", format_span_id(suite_span_id)},
+            {:"test.module.span_id", format_span_id(module_span_id)}
+          ]
+        }
       )
 
     # Store test span for later completion
@@ -235,18 +273,25 @@ defmodule OpentelemetryExUnitFormatter do
   @doc false
   @impl GenServer
   def handle_cast({:suite_finished, times}, state) do
-    %{suite_span_ctx: span_ctx} = state
+    span_ctx = Map.get(state, :suite_span_ctx)
+
+    IO.puts("[#{__MODULE__}] suite_finished: span_ctx=#{inspect(span_ctx)}")
 
     if span_ctx do
       attributes = normalize_suite_event(times, state)
       status = get_suite_status(attributes)
 
+      IO.puts("[#{__MODULE__}] suite_finished: ending span with status=#{inspect(status)}")
+
       :otel_span.set_status(span_ctx, status, "")
       :otel_span.set_attributes(span_ctx, Map.to_list(attributes))
       :otel_span.end_span(span_ctx)
 
+      IO.puts("[#{__MODULE__}] suite_finished: span ended successfully")
+
       {:noreply, %{state | suite_span_ctx: nil}}
     else
+      IO.puts("[#{__MODULE__}] suite_finished: NO SPAN CTX - suite span was not created!")
       {:noreply, state}
     end
   end
@@ -430,6 +475,13 @@ defmodule OpentelemetryExUnitFormatter do
   defp get_status_reason(nil), do: ""
   defp get_status_reason({_, reason}), do: inspect(reason)
   defp get_status_reason(_), do: ""
+
+  # Format span_id as hex string for attributes
+  defp format_span_id(nil), do: ""
+  defp format_span_id(span_id) when is_integer(span_id) do
+    Integer.to_string(span_id, 16) |> String.downcase() |> String.pad_leading(16, "0")
+  end
+  defp format_span_id(span_id), do: inspect(span_id)
 
   defp prefix_root_attribute(attributes, root_attribute) do
     attributes
