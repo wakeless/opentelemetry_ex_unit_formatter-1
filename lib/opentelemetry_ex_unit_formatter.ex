@@ -140,11 +140,12 @@ defmodule OpentelemetryExUnitFormatter do
      |> Map.put(:suite_span_id, suite_span_id)}
   end
 
-  # Module started - create span as sibling (not child) of suite, but with same trace_id
-  # Store suite_span_id as attribute for reference
+  # Module/Case started - create span as child of suite
+  # Handles both old (:module_started) and new (:case_started) event names
   @doc false
   @impl GenServer
-  def handle_cast({:module_started, %ExUnit.TestModule{name: module_name}}, state) do
+  def handle_cast({event, %{name: module_name}}, state)
+      when event in [:module_started, :case_started] do
     %{tracer_provider: tracer, span_name: span_name} = state
     suite_span_id = Map.get(state, :suite_span_id)
 
@@ -248,10 +249,12 @@ defmodule OpentelemetryExUnitFormatter do
     end
   end
 
-  # Module finished - complete span with attributes
+  # Module/Case finished - complete span with attributes
+  # Handles both old (:module_finished) and new (:case_finished) event names
   @doc false
   @impl GenServer
-  def handle_cast({:module_finished, %ExUnit.TestModule{name: module_name, state: module_state} = module}, state) do
+  def handle_cast({event, %{name: module_name, state: module_state} = module}, state)
+      when event in [:module_finished, :case_finished] do
     %{module_spans: module_spans} = state
     span_ctx = Map.get(module_spans, module_name)
 
@@ -362,13 +365,9 @@ defmodule OpentelemetryExUnitFormatter do
   end
 
   # Normalize module event with OTel semantic convention attributes
+  # Works with both ExUnit.TestModule (old) and ExUnit.TestCase (new)
   defp normalize_module_event(
-         %ExUnit.TestModule{
-           file: file,
-           name: name,
-           state: state,
-           tests: tests
-         },
+         %{file: file, name: name, state: state, tests: tests},
          config
        ) do
     %{root_attribute: root_attribute, partition_no: partition_no, seed: seed, before_send: before_send} = config
