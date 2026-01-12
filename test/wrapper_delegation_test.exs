@@ -27,9 +27,10 @@ defmodule WrapperDelegationTest do
       event_name = if is_tuple(event), do: elem(event, 0), else: event
       IO.puts("[TestWrapper] handle_cast received: #{inspect(event_name)}")
 
-      # Special logging for suite_finished
+      # Special logging for suite_finished - log the FULL event to see format
       if event_name == :suite_finished do
-        IO.puts("[TestWrapper] >>> SUITE_FINISHED EVENT RECEIVED <<<")
+        IO.puts("[TestWrapper] >>> SUITE_FINISHED FULL EVENT: #{inspect(event)} <<<")
+        IO.puts("[TestWrapper] >>> TUPLE SIZE: #{tuple_size(event)} <<<")
       end
 
       OpentelemetryExUnitFormatter.handle_cast(event, state)
