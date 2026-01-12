@@ -5,7 +5,7 @@ defmodule WrapperDelegationTest do
   """
   use ExUnit.Case
 
-  # Mimics GitlabBot.Otel.ExUnitFormatter wrapper
+  # Mimics GitlabBot.Otel.ExUnitFormatter wrapper with event logging
   defmodule TestWrapper do
     use GenServer
 
@@ -16,14 +16,24 @@ defmodule WrapperDelegationTest do
 
       # Register after_suite callback like pipie does
       ExUnit.after_suite(fn _result ->
-        IO.puts("[TestWrapper] after_suite callback executed")
+        IO.puts("[TestWrapper] after_suite callback executed - suite_finished should have been received BEFORE this!")
       end)
 
       result
     end
 
-    # Delegate handle_cast to the real formatter
-    defdelegate handle_cast(event, state), to: OpentelemetryExUnitFormatter
+    # Intercept handle_cast to log events BEFORE delegating
+    def handle_cast(event, state) do
+      event_name = if is_tuple(event), do: elem(event, 0), else: event
+      IO.puts("[TestWrapper] handle_cast received: #{inspect(event_name)}")
+
+      # Special logging for suite_finished
+      if event_name == :suite_finished do
+        IO.puts("[TestWrapper] >>> SUITE_FINISHED EVENT RECEIVED <<<")
+      end
+
+      OpentelemetryExUnitFormatter.handle_cast(event, state)
+    end
   end
 
   # Simple dummy test module
